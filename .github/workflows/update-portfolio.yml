@@ -1,0 +1,37 @@
+name: Update portfolio dashboard
+
+on:
+  schedule:
+    # 16:30 Asia/Shanghai, Monday-Friday. Holiday runs exit with no changes.
+    - cron: '30 8 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: portfolio-dashboard-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Fetch confirmed market data
+        run: node scripts/update-portfolio.mjs
+      - name: Commit a new trading day
+        shell: bash
+        run: |
+          if git diff --quiet -- index.html; then
+            echo "No new confirmed trading-day data."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          git commit -m "Update portfolio for latest trading day"
+          git push
