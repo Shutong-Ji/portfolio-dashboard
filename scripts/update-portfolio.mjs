@@ -1,12 +1,21 @@
 import { readFile, writeFile } from 'node:fs/promises';
-import https from 'node:https';
 import { fileURLToPath } from 'node:url';
 
 const indexPath = fileURLToPath(new URL('../index.html', import.meta.url));
 const entryDate = '2026-07-28';
 const today = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai' }).format(new Date());
+const shanghaiParts = new Intl.DateTimeFormat('sv-SE', {
+  timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+}).formatToParts(new Date());
+const shanghaiMinutes = Number(shanghaiParts.find(part => part.type === 'hour')?.value) * 60
+  + Number(shanghaiParts.find(part => part.type === 'minute')?.value);
+const confirmedThrough = shanghaiMinutes >= 15 * 60
+  ? today
+  : new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai' })
+      .format(new Date(Date.now() - 24 * 60 * 60 * 1000));
 const fundCode = '009803';
 const fundAmount = 6850;
+const fundEntryNav = 1.3263;
 const etfs = [
   ['512890', 2800, '1'], ['159915', 2800, '0'], ['513500', 1400, '1'],
   ['513100', 1100, '1'], ['511130', 600, '1'], ['159985', 1100, '0'],
@@ -15,36 +24,21 @@ const etfs = [
 
 async function json(url, headers = {}) {
   let lastError;
-  for (let attempt = 1; attempt <= 4; attempt++) {
+  for (let attempt = 1; attempt <= 8; attempt++) {
     try {
-      const body = await new Promise((resolve, reject) => {
-        const request = https.get(url, {
-          agent: false,
-          headers: {
-            Accept: 'application/json,text/plain,*/*',
-            Connection: 'close',
-            'User-Agent': 'Mozilla/5.0 portfolio-dashboard-updater/1.0',
-            ...headers,
-          },
-        }, response => {
-          let data = '';
-          response.setEncoding('utf8');
-          response.on('data', chunk => { data += chunk; });
-          response.on('end', () => {
-            if (response.statusCode < 200 || response.statusCode >= 300) {
-              reject(new Error(`${response.statusCode} ${url}`));
-            } else {
-              resolve(data);
-            }
-          });
-        });
-        request.setTimeout(30000, () => request.destroy(new Error('Request timed out')));
-        request.on('error', reject);
+      const response = await fetch(url, {
+        headers: {
+          Accept: 'application/json,text/plain,*/*',
+          'User-Agent': 'Mozilla/5.0 portfolio-dashboard-updater/1.0',
+          ...headers,
+        },
+        signal: AbortSignal.timeout(30000),
       });
-      return JSON.parse(body);
+      if (!response.ok) throw new Error(`${response.status} ${url}`);
+      return await response.json();
     } catch (error) {
       lastError = error;
-      if (attempt < 4) await new Promise(resolve => setTimeout(resolve, attempt * 1500));
+      if (attempt < 8) await new Promise(resolve => setTimeout(resolve, attempt * 2500));
     }
   }
   throw lastError;
@@ -88,21 +82,31 @@ function latestFundOn(rows, date) {
   return candidates.at(-1);
 }
 
+console.log(`Loading ${fundCode} NAV history...`);
 const fundRows = await fundHistory();
 const loadedEtfs = [];
 for (const item of etfs) {
+  console.log(`Loading ${item.code} daily closes...`);
   loadedEtfs.push(await etfHistory(item));
-  await new Promise(resolve => setTimeout(resolve, 350));
+  await new Promise(resolve => setTimeout(resolve, 1200));
 }
 
 let dates = [...loadedEtfs[0].prices.keys()];
 for (const item of loadedEtfs.slice(1)) dates = dates.filter(date => item.prices.has(date));
-dates = dates.filter(date => date >= entryDate).sort();
+dates = dates.filter(date => date >= entryDate && date <= confirmedThrough).sort();
 if (!dates.length) throw new Error('No common ETF trading dates');
 
 const latestDate = dates.at(-1);
-const fundEntry = latestFundOn(fundRows, entryDate).nav;
-const fundLatest = latestFundOn(fundRows, latestDate);
+const publishedFundEntry = latestFundOn(fundRows, entryDate);
+if (publishedFundEntry.nav !== fundEntryNav) {
+  console.warn(
+    `Ignoring published ${fundCode} entry NAV ${publishedFundEntry.nav}; ` +
+    `the portfolio entry NAV is fixed at ${fundEntryNav}.`,
+  );
+}
+const fundEntry = fundEntryNav;
+const fundLatest = fundRows.at(-1);
+const fundPrevious = fundRows.at(-2) ?? fundLatest;
 const fundUnits = fundAmount / fundEntry;
 
 let cost = fundAmount;
@@ -139,7 +143,7 @@ const fundFallback = {
   [fundCode]: {
     entry: fundEntry,
     nav: fundLatest.nav,
-    pre: latestFundOn(fundRows, dates.at(-2) ?? entryDate).nav,
+    pre: fundPrevious.nav,
     date: fundLatest.date,
   },
 };
