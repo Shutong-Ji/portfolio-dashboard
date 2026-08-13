@@ -133,6 +133,7 @@ const history = dates.map(date => ({
 const market = Object.fromEntries(loadedEtfs.map(item => {
   const index = dates.length - 1;
   return [item.code, {
+    entry: item.entry,
     price: item.prices.get(dates[index]),
     pre: item.prices.get(dates[Math.max(0, index - 1)]),
     date: latestDate,
