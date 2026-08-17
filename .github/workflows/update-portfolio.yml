@@ -1,6 +1,12 @@
 name: Update portfolio dashboard
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/update-portfolio.yml'
+      - 'scripts/update-portfolio.mjs'
+      - 'tests/update-portfolio.test.mjs'
   schedule:
     # 16:30 Asia/Shanghai, Monday-Friday. Holiday runs exit with no changes.
     - cron: '30 8 * * 1-5'
@@ -21,6 +27,8 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: '20'
+      - name: Test updater behavior
+        run: node --test tests/update-portfolio.test.mjs
       - name: Fetch confirmed market data
         run: node scripts/update-portfolio.mjs
       - name: Commit a new trading day
