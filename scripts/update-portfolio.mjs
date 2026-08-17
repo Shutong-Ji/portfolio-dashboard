@@ -1,18 +1,8 @@
 import { readFile, writeFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const indexPath = fileURLToPath(new URL('../index.html', import.meta.url));
-const entryDate = '2026-07-28';
-const today = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai' }).format(new Date());
-const shanghaiParts = new Intl.DateTimeFormat('sv-SE', {
-  timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
-}).formatToParts(new Date());
-const shanghaiMinutes = Number(shanghaiParts.find(part => part.type === 'hour')?.value) * 60
-  + Number(shanghaiParts.find(part => part.type === 'minute')?.value);
-const confirmedThrough = shanghaiMinutes >= 15 * 60
-  ? today
-  : new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai' })
-      .format(new Date(Date.now() - 24 * 60 * 60 * 1000));
+const defaultIndexPath = fileURLToPath(new URL('../index.html', import.meta.url));
 const fundCode = '009803';
 const fundAmount = 6850;
 const fundEntryNav = 1.3263;
@@ -22,143 +12,279 @@ const etfs = [
   ['159980', 2000, '0'], ['159981', 1600, '0'], ['518880', 200, '1'],
 ].map(([code, units, market]) => ({ code, units, market }));
 
-async function json(url, headers = {}) {
+const shanghaiDate = date => new Intl.DateTimeFormat('sv-SE', {
+  timeZone: 'Asia/Shanghai',
+}).format(date);
+
+function shanghaiMinutes(date) {
+  const parts = new Intl.DateTimeFormat('sv-SE', {
+    timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).formatToParts(date);
+  const value = type => Number(parts.find(part => part.type === type)?.value);
+  return value('hour') * 60 + value('minute');
+}
+
+function confirmedThrough(now) {
+  return shanghaiMinutes(now) >= 15 * 60
+    ? shanghaiDate(now)
+    : shanghaiDate(new Date(now.getTime() - 24 * 60 * 60 * 1000));
+}
+
+function readConstant(html, name) {
+  const match = html.match(new RegExp(`const ${name}=(.*?);`));
+  if (!match) throw new Error(`Missing ${name} in index.html`);
+  return JSON.parse(match[1]);
+}
+
+function replaceConstant(html, name, value) {
+  return html.replace(
+    new RegExp(`const ${name}=.*?;`),
+    `const ${name}=${JSON.stringify(value)};`,
+  );
+}
+
+async function fetchJson(url, { fetchFn, headers = {}, sleep, attempts = 4 }) {
   let lastError;
-  for (let attempt = 1; attempt <= 8; attempt++) {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
-      const response = await fetch(url, {
+      const response = await fetchFn(url, {
         headers: {
           Accept: 'application/json,text/plain,*/*',
-          'User-Agent': 'Mozilla/5.0 portfolio-dashboard-updater/1.0',
+          'User-Agent': 'Mozilla/5.0 portfolio-dashboard-updater/2.0',
           ...headers,
         },
-        signal: AbortSignal.timeout(30000),
+        signal: AbortSignal.timeout(20000),
       });
       if (!response.ok) throw new Error(`${response.status} ${url}`);
       return await response.json();
     } catch (error) {
       lastError = error;
-      if (attempt < 8) await new Promise(resolve => setTimeout(resolve, attempt * 2500));
+      if (attempt < attempts) await sleep(attempt * 1500);
     }
   }
   throw lastError;
 }
 
-async function etfHistory(item) {
-  const url = new URL('https://push2his.eastmoney.com/api/qt/stock/kline/get');
-  url.search = new URLSearchParams({
-    secid: `${item.market}.${item.code}`, klt: '101', fqt: '0',
-    beg: entryDate.replaceAll('-', ''), end: '20500101',
-    fields1: 'f1,f2,f3,f4,f5,f6', fields2: 'f51,f52,f53',
-  });
-  const payload = await json(url);
-  const rows = payload?.data?.klines ?? [];
-  if (!rows.length) throw new Error(`No ETF history for ${item.code}`);
-  item.prices = new Map(rows.map(row => {
-    const [date, , close] = row.split(',');
-    return [date, Number(close)];
-  }));
-  return item;
+function validateSnapshots(snapshots) {
+  if (snapshots.length !== etfs.length) {
+    throw new Error(`Incomplete ETF snapshot: expected ${etfs.length}, received ${snapshots.length}`);
+  }
+  const dates = new Set(snapshots.map(item => item.date));
+  if (dates.size !== 1) throw new Error('Mixed-date ETF snapshot');
+  return snapshots;
 }
 
-async function fundHistory() {
+async function eastmoneyEtfSnapshot({ fetchFn, sleep }) {
+  const secids = etfs.map(item => `${item.market}.${item.code}`).join(',');
+  const url = new URL('https://push2.eastmoney.com/api/qt/ulist.np/get');
+  url.search = new URLSearchParams({
+    secids, fields: 'f2,f12,f18,f124', fltt: '2',
+  });
+  const payload = await fetchJson(url, { fetchFn, sleep });
+  const rows = payload?.data?.diff;
+  if (!Array.isArray(rows) || rows.length !== etfs.length) {
+    throw new Error(`Incomplete ETF snapshot: expected ${etfs.length}, received ${rows?.length ?? 0}`);
+  }
+
+  const byCode = new Map(rows.map(row => [String(row.f12), row]));
+  const snapshots = etfs.map(item => {
+    const row = byCode.get(item.code);
+    const price = Number(row?.f2);
+    const pre = Number(row?.f18);
+    const timestamp = Number(row?.f124);
+    if (!row || !Number.isFinite(price) || price <= 0 ||
+        !Number.isFinite(pre) || pre <= 0 ||
+        !Number.isFinite(timestamp) || timestamp <= 0) {
+      throw new Error(`Invalid ETF snapshot for ${item.code}`);
+    }
+    return {
+      code: item.code,
+      price,
+      pre,
+      date: shanghaiDate(new Date(timestamp * 1000)),
+    };
+  });
+  return validateSnapshots(snapshots);
+}
+
+async function tencentEtfSnapshot({ fetchFn, sleep }) {
+  const symbols = etfs.map(item => `${item.market === '1' ? 'sh' : 'sz'}${item.code}`).join(',');
+  const url = `https://qt.gtimg.cn/q=${symbols}`;
+  let lastError;
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      const response = await fetchFn(url, {
+        headers: {
+          Accept: 'text/plain,*/*',
+          Referer: 'https://gu.qq.com/',
+          'User-Agent': 'Mozilla/5.0 portfolio-dashboard-updater/2.0',
+        },
+        signal: AbortSignal.timeout(20000),
+      });
+      if (!response.ok) throw new Error(`${response.status} ${url}`);
+      const body = new TextDecoder('gb18030').decode(await response.arrayBuffer());
+      const rows = new Map();
+      for (const match of body.matchAll(/v_(?:sh|sz)(\d+)="([^"]*)";/g)) {
+        rows.set(match[1], match[2].split('~'));
+      }
+      const snapshots = etfs.map(item => {
+        const fields = rows.get(item.code);
+        const price = Number(fields?.[3]);
+        const pre = Number(fields?.[4]);
+        const quoteTime = fields?.find(value => /^\d{14}$/.test(value));
+        if (!fields || !Number.isFinite(price) || price <= 0 ||
+            !Number.isFinite(pre) || pre <= 0 || !quoteTime) {
+          throw new Error(`Invalid Tencent ETF snapshot for ${item.code}`);
+        }
+        return {
+          code: item.code,
+          price,
+          pre,
+          date: `${quoteTime.slice(0, 4)}-${quoteTime.slice(4, 6)}-${quoteTime.slice(6, 8)}`,
+        };
+      });
+      return validateSnapshots(snapshots);
+    } catch (error) {
+      lastError = error;
+      if (attempt < 4) await sleep(attempt * 1500);
+    }
+  }
+  throw lastError;
+}
+
+async function latestEtfSnapshot(options) {
+  try {
+    return await eastmoneyEtfSnapshot(options);
+  } catch (eastmoneyError) {
+    try {
+      return await tencentEtfSnapshot(options);
+    } catch (tencentError) {
+      throw new AggregateError(
+        [eastmoneyError, tencentError],
+        'Both ETF quote sources are unavailable',
+      );
+    }
+  }
+}
+
+async function latestFundRows({ fetchFn, sleep, now }) {
   const url = new URL('https://api.fund.eastmoney.com/f10/lsjz');
   url.search = new URLSearchParams({
-    fundCode, pageIndex: '1', pageSize: '100',
-    startDate: entryDate, endDate: today,
+    fundCode, pageIndex: '1', pageSize: '20', startDate: '', endDate: shanghaiDate(now),
   });
-  const payload = await json(url, { Referer: 'https://fundf10.eastmoney.com/' });
+  const payload = await fetchJson(url, {
+    fetchFn,
+    sleep,
+    headers: { Referer: 'https://fundf10.eastmoney.com/' },
+  });
   const rows = payload?.Data?.LSJZList ?? [];
-  if (!rows.length) throw new Error(`No fund history for ${fundCode}`);
-  return rows
+  const normalized = rows
     .map(row => ({ date: row.FSRQ, nav: Number(row.DWJZ) }))
-    .filter(row => Number.isFinite(row.nav))
+    .filter(row => /^\d{4}-\d{2}-\d{2}$/.test(row.date) && Number.isFinite(row.nav) && row.nav > 0)
     .sort((a, b) => a.date.localeCompare(b.date));
+  if (!normalized.length) throw new Error(`No valid NAV history for ${fundCode}`);
+  return normalized;
 }
 
-function latestFundOn(rows, date) {
-  const candidates = rows.filter(row => row.date <= date);
-  if (!candidates.length) throw new Error(`No fund NAV on or before ${date}`);
-  return candidates.at(-1);
+function fundNavOn(rows, date, fallback) {
+  const row = rows.filter(item => item.date <= date).at(-1);
+  if (row) return row.nav;
+  if (fallback.date <= date) return fallback.nav;
+  throw new Error(`No ${fundCode} NAV on or before ${date}`);
 }
 
-console.log(`Loading ${fundCode} NAV history...`);
-const fundRows = await fundHistory();
-const loadedEtfs = [];
-for (const item of etfs) {
-  console.log(`Loading ${item.code} daily closes...`);
-  loadedEtfs.push(await etfHistory(item));
-  await new Promise(resolve => setTimeout(resolve, 1200));
+function portfolioCost(market) {
+  return etfs.reduce((sum, item) => {
+    const entry = Number(market[item.code]?.entry);
+    if (!Number.isFinite(entry) || entry <= 0) throw new Error(`Missing entry price for ${item.code}`);
+    return sum + entry * item.units + Math.max(entry * item.units * 0.0001, 5);
+  }, fundAmount);
 }
 
-let dates = [...loadedEtfs[0].prices.keys()];
-for (const item of loadedEtfs.slice(1)) dates = dates.filter(date => item.prices.has(date));
-dates = dates.filter(date => date >= entryDate && date <= confirmedThrough).sort();
-if (!dates.length) throw new Error('No common ETF trading dates');
-
-const latestDate = dates.at(-1);
-const publishedFundEntry = latestFundOn(fundRows, entryDate);
-if (publishedFundEntry.nav !== fundEntryNav) {
-  console.warn(
-    `Ignoring published ${fundCode} entry NAV ${publishedFundEntry.nav}; ` +
-    `the portfolio entry NAV is fixed at ${fundEntryNav}.`,
-  );
-}
-const fundEntry = fundEntryNav;
-const fundLatest = fundRows.at(-1);
-const fundPrevious = fundRows.at(-2) ?? fundLatest;
-const fundUnits = fundAmount / fundEntry;
-
-let cost = fundAmount;
-for (const item of loadedEtfs) {
-  const entry = item.prices.get(entryDate);
-  if (!entry) throw new Error(`Missing ${item.code} entry close`);
-  item.entry = entry;
-  cost += entry * item.units + Math.max(entry * item.units * 0.0001, 5);
+function portfolioNav(market, fundNav, cost) {
+  const value = etfs.reduce((sum, item) => {
+    const price = Number(market[item.code]?.price);
+    if (!Number.isFinite(price) || price <= 0) throw new Error(`Missing price for ${item.code}`);
+    return sum + price * item.units;
+  }, fundNav * (fundAmount / fundEntryNav));
+  return value / cost;
 }
 
-const valueOn = date => {
-  const etfValue = loadedEtfs.reduce(
-    (sum, item) => sum + item.prices.get(date) * item.units,
-    0,
-  );
-  return etfValue + latestFundOn(fundRows, date).nav * fundUnits;
-};
+export async function updatePortfolio({
+  indexPath = defaultIndexPath,
+  fetchFn = fetch,
+  now = new Date(),
+  sleep = ms => new Promise(resolveSleep => setTimeout(resolveSleep, ms)),
+  logger = console,
+} = {}) {
+  const before = await readFile(indexPath, 'utf8');
+  const oldMarket = readConstant(before, 'MARKET_FALLBACK');
+  const oldHistory = readConstant(before, 'HISTORY_FALLBACK');
+  const oldFund = readConstant(before, 'FUND_FALLBACK')[fundCode];
+  if (!oldHistory.length || !oldFund) throw new Error('Missing existing portfolio snapshot');
 
-const history = dates.map(date => ({
-  date,
-  nav: date === entryDate ? 1 : valueOn(date) / cost,
-}));
+  const [etfResult, fundResult] = await Promise.allSettled([
+    latestEtfSnapshot({ fetchFn, sleep }),
+    latestFundRows({ fetchFn, sleep, now }),
+  ]);
+  if (etfResult.status === 'rejected') {
+    logger.warn(`ETF source unavailable; keeping the last complete snapshot: ${etfResult.reason}`);
+  }
+  if (fundResult.status === 'rejected') {
+    logger.warn(`Fund source unavailable; keeping the last confirmed NAV: ${fundResult.reason}`);
+  }
 
-const market = Object.fromEntries(loadedEtfs.map(item => {
-  const index = dates.length - 1;
-  return [item.code, {
-    entry: item.entry,
-    price: item.prices.get(dates[index]),
-    pre: item.prices.get(dates[Math.max(0, index - 1)]),
-    date: latestDate,
-  }];
-}));
+  const fundRows = fundResult.status === 'fulfilled' ? fundResult.value : [];
+  const newFund = fundRows.length ? {
+    entry: fundEntryNav,
+    nav: fundRows.at(-1).nav,
+    pre: (fundRows.at(-2) ?? fundRows.at(-1)).nav,
+    date: fundRows.at(-1).date,
+  } : { ...oldFund, entry: fundEntryNav };
 
-const fundFallback = {
-  [fundCode]: {
-    entry: fundEntry,
-    nav: fundLatest.nav,
-    pre: fundPrevious.nav,
-    date: fundLatest.date,
-  },
-};
+  let market = oldMarket;
+  let history = oldHistory.map(point => ({ ...point }));
+  const cost = portfolioCost(oldMarket);
+  const oldMarketDate = new Set(Object.values(oldMarket).map(item => item.date));
+  if (oldMarketDate.size !== 1) throw new Error('Existing ETF snapshot has mixed dates');
+  const previousDate = [...oldMarketDate][0];
 
-let html = await readFile(indexPath, 'utf8');
-html = html
-  .replace(/const MARKET_FALLBACK=.*?;/, `const MARKET_FALLBACK=${JSON.stringify(market)};`)
-  .replace(/const HISTORY_FALLBACK=.*?;/, `const HISTORY_FALLBACK=${JSON.stringify(history)};`)
-  .replace(/const FUND_FALLBACK=.*?;/, `const FUND_FALLBACK=${JSON.stringify(fundFallback)};`);
+  // Correct the most recent point when its fund NAV was published after the ETF close.
+  const lastPoint = history.at(-1);
+  const confirmedFundForPreviousDate = fundRows.find(row => row.date === previousDate);
+  if (lastPoint?.date === previousDate && confirmedFundForPreviousDate) {
+    lastPoint.nav = portfolioNav(oldMarket, confirmedFundForPreviousDate.nav, cost);
+  }
 
-const before = await readFile(indexPath, 'utf8');
-if (html === before) {
-  console.log(`No new trading-day data after ${latestDate}; no update needed.`);
-} else {
+  if (etfResult.status === 'fulfilled') {
+    const snapshots = etfResult.value;
+    const quoteDate = snapshots[0].date;
+    if (quoteDate <= confirmedThrough(now) && quoteDate > previousDate) {
+      market = Object.fromEntries(snapshots.map(snapshot => [snapshot.code, {
+        entry: oldMarket[snapshot.code].entry,
+        price: snapshot.price,
+        pre: snapshot.pre,
+        date: quoteDate,
+      }]));
+      history.push({
+        date: quoteDate,
+        nav: portfolioNav(market, fundNavOn(fundRows, quoteDate, newFund), cost),
+      });
+    }
+  }
+
+  let html = replaceConstant(before, 'MARKET_FALLBACK', market);
+  html = replaceConstant(html, 'HISTORY_FALLBACK', history);
+  html = replaceConstant(html, 'FUND_FALLBACK', { [fundCode]: newFund });
+  if (html === before) {
+    logger.log(`No new confirmed trading-day data after ${history.at(-1).date}; no update needed.`);
+    return { changed: false, date: history.at(-1).date };
+  }
   await writeFile(indexPath, html, 'utf8');
-  console.log(`Updated through trading day ${latestDate}; fund NAV date ${fundLatest.date}.`);
+  logger.log(`Updated through trading day ${history.at(-1).date}; fund NAV date ${newFund.date}.`);
+  return { changed: true, date: history.at(-1).date, fundDate: newFund.date };
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await updatePortfolio();
 }
