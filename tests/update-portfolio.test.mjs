@@ -78,6 +78,49 @@ test('appends one complete trading-day snapshot and keeps the fixed fund entry N
   assert.equal(fund.date, '2026-08-14');
 });
 
+test('backfills a missed trading day from the common ETF calendar', async () => {
+  const indexPath = await fixture(baseHtml('2026-08-13'));
+  const fetchFn = async url => {
+    const value = String(url);
+    if (value.includes('ulist.np')) {
+      return response({ data: { diff: codes.map((code, index) => ({
+        f12: code,
+        f2: price[index] + 0.02,
+        f18: price[index] + 0.01,
+        f124: timestamp('2026-08-17T07:00:00Z'),
+      })) } });
+    }
+    if (value.includes('fqkline')) {
+      const symbol = new URL(value).searchParams.get('param').split(',')[0];
+      const index = codes.indexOf(symbol.slice(2));
+      return response({ data: { [symbol]: { day: [
+        ['2026-07-28', '0', String(entry[index])],
+        ['2026-08-13', '0', String(price[index])],
+        ['2026-08-14', '0', String(price[index] + 0.005)],
+        ['2026-08-17', '0', String(price[index] + 0.02)],
+      ] } } });
+    }
+    return response({ Data: { LSJZList: [
+      { FSRQ: '2026-08-14', DWJZ: '1.3310' },
+      { FSRQ: '2026-08-13', DWJZ: '1.3308' },
+      { FSRQ: '2026-07-28', DWJZ: '1.3263' },
+    ] } });
+  };
+  await updatePortfolio({
+    indexPath,
+    fetchFn,
+    now: new Date('2026-08-17T09:00:00Z'),
+    sleep: async () => {},
+    logger: quiet,
+  });
+  const history = constant(await readFile(indexPath, 'utf8'), 'HISTORY_FALLBACK');
+  assert.deepEqual(history.map(point => point.date), [
+    '2026-07-28', '2026-08-13', '2026-08-14', '2026-08-17',
+  ]);
+  assert.equal(history[0].nav, 1);
+  assert.ok(history.every(point => !['2026-08-15', '2026-08-16'].includes(point.date)));
+});
+
 test('does not append a duplicate or weekend date', async () => {
   const indexPath = await fixture(baseHtml('2026-08-14'));
   const result = await updatePortfolio({

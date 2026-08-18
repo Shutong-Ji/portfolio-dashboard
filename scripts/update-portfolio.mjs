@@ -6,6 +6,7 @@ const defaultIndexPath = fileURLToPath(new URL('../index.html', import.meta.url)
 const fundCode = '009803';
 const fundAmount = 6850;
 const fundEntryNav = 1.3263;
+const entryDate = '2026-07-28';
 const etfs = [
   ['512890', 2800, '1'], ['159915', 2800, '0'], ['513500', 1400, '1'],
   ['513100', 1100, '1'], ['511130', 600, '1'], ['159985', 1100, '0'],
@@ -170,7 +171,7 @@ async function latestEtfSnapshot(options) {
 async function latestFundRows({ fetchFn, sleep, now }) {
   const url = new URL('https://api.fund.eastmoney.com/f10/lsjz');
   url.search = new URLSearchParams({
-    fundCode, pageIndex: '1', pageSize: '20', startDate: '', endDate: shanghaiDate(now),
+    fundCode, pageIndex: '1', pageSize: '100', startDate: entryDate, endDate: shanghaiDate(now),
   });
   const payload = await fetchJson(url, {
     fetchFn,
@@ -184,6 +185,31 @@ async function latestFundRows({ fetchFn, sleep, now }) {
     .sort((a, b) => a.date.localeCompare(b.date));
   if (!normalized.length) throw new Error(`No valid NAV history for ${fundCode}`);
   return normalized;
+}
+
+async function tencentHistoricalCloses({ fetchFn, sleep, endDate }) {
+  const histories = await Promise.all(etfs.map(async item => {
+    const symbol = `${item.market === '1' ? 'sh' : 'sz'}${item.code}`;
+    const url = new URL('https://web.ifzq.gtimg.cn/appstock/app/fqkline/get');
+    url.search = new URLSearchParams({
+      param: `${symbol},day,${entryDate},${endDate},200,none`,
+    });
+    const payload = await fetchJson(url, {
+      fetchFn,
+      sleep,
+      headers: { Referer: 'https://gu.qq.com/' },
+    });
+    const rows = payload?.data?.[symbol]?.day;
+    if (!Array.isArray(rows) || !rows.length) {
+      throw new Error(`No Tencent history for ${item.code}`);
+    }
+    const closes = new Map(rows
+      .map(row => [row?.[0], Number(row?.[2])])
+      .filter(([date, close]) => /^\d{4}-\d{2}-\d{2}$/.test(date) && Number.isFinite(close) && close > 0));
+    if (!closes.size) throw new Error(`Invalid Tencent history for ${item.code}`);
+    return [item.code, closes];
+  }));
+  return new Map(histories);
 }
 
 function fundNavOn(rows, date, fallback) {
@@ -223,15 +249,20 @@ export async function updatePortfolio({
   const oldFund = readConstant(before, 'FUND_FALLBACK')[fundCode];
   if (!oldHistory.length || !oldFund) throw new Error('Missing existing portfolio snapshot');
 
-  const [etfResult, fundResult] = await Promise.allSettled([
+  const throughDate = confirmedThrough(now);
+  const [etfResult, fundResult, historyResult] = await Promise.allSettled([
     latestEtfSnapshot({ fetchFn, sleep }),
     latestFundRows({ fetchFn, sleep, now }),
+    tencentHistoricalCloses({ fetchFn, sleep, endDate: throughDate }),
   ]);
   if (etfResult.status === 'rejected') {
     logger.warn(`ETF source unavailable; keeping the last complete snapshot: ${etfResult.reason}`);
   }
   if (fundResult.status === 'rejected') {
     logger.warn(`Fund source unavailable; keeping the last confirmed NAV: ${fundResult.reason}`);
+  }
+  if (historyResult.status === 'rejected') {
+    logger.warn(`Historical source unavailable; keeping the existing confirmed curve: ${historyResult.reason}`);
   }
 
   const fundRows = fundResult.status === 'fulfilled' ? fundResult.value : [];
@@ -259,7 +290,7 @@ export async function updatePortfolio({
   if (etfResult.status === 'fulfilled') {
     const snapshots = etfResult.value;
     const quoteDate = snapshots[0].date;
-    if (quoteDate <= confirmedThrough(now) && quoteDate > previousDate) {
+    if (quoteDate <= throughDate && quoteDate > previousDate) {
       market = Object.fromEntries(snapshots.map(snapshot => [snapshot.code, {
         entry: oldMarket[snapshot.code].entry,
         price: snapshot.price,
@@ -270,6 +301,41 @@ export async function updatePortfolio({
         date: quoteDate,
         nav: portfolioNav(market, fundNavOn(fundRows, quoteDate, newFund), cost),
       });
+    }
+  }
+
+  // Rebuild the curve from a complete common trading calendar. This fills any
+  // weekday missed by a failed workflow without ever inventing weekend points.
+  if (historyResult.status === 'fulfilled' && fundRows.length) {
+    const closesByCode = historyResult.value;
+    const commonDates = [...closesByCode.get(etfs[0].code).keys()]
+      .filter(date => date >= entryDate && date <= throughDate &&
+        etfs.every(item => closesByCode.get(item.code)?.has(date)))
+      .sort();
+    if (commonDates.length && commonDates[0] === entryDate) {
+      history = commonDates.map(date => {
+        const historicalMarket = Object.fromEntries(etfs.map(item => [item.code, {
+          entry: oldMarket[item.code].entry,
+          price: closesByCode.get(item.code).get(date),
+        }]));
+        return {
+          date,
+          nav: portfolioNav(historicalMarket, fundNavOn(fundRows, date, newFund), cost),
+        };
+      });
+      history[0].nav = 1;
+
+      const latestDate = commonDates.at(-1);
+      if (latestDate > previousDate &&
+          (etfResult.status !== 'fulfilled' || etfResult.value[0].date !== latestDate)) {
+        const priorDate = commonDates.at(-2) ?? latestDate;
+        market = Object.fromEntries(etfs.map(item => [item.code, {
+          entry: oldMarket[item.code].entry,
+          price: closesByCode.get(item.code).get(latestDate),
+          pre: closesByCode.get(item.code).get(priorDate),
+          date: latestDate,
+        }]));
+      }
     }
   }
 

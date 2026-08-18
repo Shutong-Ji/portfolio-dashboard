@@ -6,10 +6,10 @@ on:
     paths:
       - '.github/workflows/update-portfolio.yml'
       - 'scripts/update-portfolio.mjs'
-      - 'tests/update-portfolio.test.mjs'
+      - 'tests/*.test.mjs'
   schedule:
-    # 16:30 Asia/Shanghai, Monday-Friday. Holiday runs exit with no changes.
-    - cron: '30 8 * * 1-5'
+    # 15:10 Asia/Shanghai, Monday-Friday. Holiday runs exit with no changes.
+    - cron: '10 7 * * 1-5'
   workflow_dispatch:
 
 permissions:
@@ -28,7 +28,7 @@ jobs:
         with:
           node-version: '20'
       - name: Test updater behavior
-        run: node --test tests/update-portfolio.test.mjs
+        run: node --test tests/*.test.mjs
       - name: Fetch confirmed market data
         run: node scripts/update-portfolio.mjs
       - name: Commit a new trading day
