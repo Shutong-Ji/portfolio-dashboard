@@ -7,7 +7,13 @@ const valuesSource = html.slice(
   html.indexOf('function values('),
   html.indexOf('\nfunction drawTrend', html.indexOf('function values(')),
 );
-const values = Function(`${valuesSource}; return values;`)();
+const evaluated = Function(`${valuesSource}; return { values, withCurrentTrendPoint };`)();
+const { values, withCurrentTrendPoint } = evaluated;
+const calendarSource = html.slice(
+  html.indexOf('function isTradingWeekday('),
+  html.indexOf('\nfunction valuationDate', html.indexOf('function isTradingWeekday(')),
+);
+const { marketCanRefresh } = Function(`${calendarSource}; return { marketCanRefresh };`)();
 
 test('labels stale ETF snapshots with their actual valuation date', () => {
   assert.match(html, /id="todayLabel"/);
@@ -35,4 +41,29 @@ test('does not mix a stale fund daily move into a different ETF valuation date',
 
 test('can refresh final quotes for thirty minutes after the close', () => {
   assert.match(html, /t\.minutes>=570&&t\.minutes<=930/);
+  assert.equal(marketCanRefresh({ weekday: 'ons', minutes: 930 }), true);
+});
+
+test('never refreshes market or fund data on weekends', () => {
+  assert.equal(marketCanRefresh({ weekday: 'lör', minutes: 600 }), false);
+  assert.equal(marketCanRefresh({ weekday: 'sön', minutes: 600 }), false);
+  assert.match(html, /const fundUpdated=isTradingWeekday\(clock\)\?await quoteFund\(fund\):false/);
+});
+
+test('appends and replaces only the current realtime trend point', () => {
+  const confirmed = [{ date: '2026-08-18', nav: 1.0302 }];
+  const intraday = withCurrentTrendPoint(confirmed, '2026-08-19', 1.0235, true);
+  assert.equal(intraday.length, 2);
+  assert.deepEqual(intraday.at(-1), { date: '2026-08-19', nav: 1.0235, live: true, latest: true });
+  const refreshed = withCurrentTrendPoint(intraday, '2026-08-19', 1.0241, true);
+  assert.equal(refreshed.length, 2);
+  assert.equal(refreshed.at(-1).nav, 1.0241);
+});
+
+test('uses Tencent realtime quotes with Eastmoney as automatic fallback', () => {
+  assert.match(html, /async function tencentETFQuotes/);
+  assert.match(html, /async function eastmoneyETFQuotes/);
+  assert.match(html, /source:'腾讯'/);
+  assert.match(html, /source:'东方财富'/);
+  assert.match(html, /new AggregateError\(\[tencentError,eastmoneyError\]/);
 });
