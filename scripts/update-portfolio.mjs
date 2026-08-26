@@ -213,6 +213,7 @@ async function tencentHistoricalCloses({ fetchFn, sleep, endDate }) {
 }
 
 function fundNavOn(rows, date, fallback) {
+  if (date === entryDate) return fundEntryNav;
   const row = rows.filter(item => item.date <= date).at(-1);
   if (row) return row.nav;
   if (fallback.date <= date) return fallback.nav;
