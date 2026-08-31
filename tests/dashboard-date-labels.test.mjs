@@ -39,9 +39,10 @@ test('does not mix a stale fund daily move into a different ETF valuation date',
   assert.ok(Math.abs(currentEtf.today - 14) < 1e-9);
 });
 
-test('can refresh final quotes for thirty minutes after the close', () => {
-  assert.match(html, /t\.minutes>=570&&t\.minutes<=930/);
+test('can recover final quotes throughout the trading-day evening', () => {
+  assert.match(html, /t\.minutes>=570/);
   assert.equal(marketCanRefresh({ weekday: 'ons', minutes: 930 }), true);
+  assert.equal(marketCanRefresh({ weekday: 'ons', minutes: 1380 }), true);
 });
 
 test('never refreshes market or fund data on weekends', () => {

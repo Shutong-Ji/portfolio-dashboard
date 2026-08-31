@@ -8,8 +8,14 @@ on:
       - 'scripts/update-portfolio.mjs'
       - 'tests/*.test.mjs'
   schedule:
-    # 15:10 Asia/Shanghai, Monday-Friday. Holiday runs exit with no changes.
-    - cron: '10 7 * * 1-5'
+    # Redundant Asia/Shanghai recovery windows. Every run is idempotent; holidays
+    # and already-current snapshots exit without a commit. Multiple off-peak
+    # times compensate for GitHub's occasionally delayed scheduled workflows.
+    - cron: '23 0 * * 1-5'  # 08:23 morning recovery
+    - cron: '23 7 * * 1-5'  # 15:23 first close attempt
+    - cron: '41 9 * * 1-5'  # 17:41 confirmed close retry
+    - cron: '17 12 * * 1-5' # 20:17 fund NAV retry
+    - cron: '37 14 * * 1-5' # 22:37 final same-day recovery
   workflow_dispatch:
 
 permissions:
@@ -22,15 +28,30 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '24'
       - name: Test updater behavior
         run: node --test tests/*.test.mjs
       - name: Fetch confirmed market data
-        run: node scripts/update-portfolio.mjs
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            if node scripts/update-portfolio.mjs; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "Update attempt $attempt failed; retrying after $((attempt * 30)) seconds."
+              sleep $((attempt * 30))
+            fi
+          done
+          echo "All update attempts failed."
+          exit 1
       - name: Commit a new trading day
         shell: bash
         run: |
@@ -42,4 +63,25 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add index.html
           git commit -m "Update portfolio for latest trading day"
-          git push
+          for push_attempt in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+            if [ "$push_attempt" -eq 3 ]; then
+              break
+            fi
+            echo "Push attempt $push_attempt failed; rebasing onto the latest main branch."
+            if git fetch origin main; then
+              if ! git rebase origin/main; then
+                git rebase --abort
+                echo "Concurrent main-branch changes conflict with this update; a later recovery window will retry."
+                exit 1
+              fi
+            else
+              echo "Fetch after push attempt $push_attempt also failed; retrying from the current checkout."
+            fi
+            echo "Retrying push after $((push_attempt * 30)) seconds."
+            sleep $((push_attempt * 30))
+          done
+          echo "Unable to push after three attempts."
+          exit 1

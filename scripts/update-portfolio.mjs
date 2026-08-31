@@ -66,6 +66,28 @@ async function fetchJson(url, { fetchFn, headers = {}, sleep, attempts = 4 }) {
   throw lastError;
 }
 
+async function fetchText(url, { fetchFn, headers = {}, sleep, attempts = 4 }) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const response = await fetchFn(url, {
+        headers: {
+          Accept: 'text/plain,*/*',
+          'User-Agent': 'Mozilla/5.0 portfolio-dashboard-updater/3.0',
+          ...headers,
+        },
+        signal: AbortSignal.timeout(20000),
+      });
+      if (!response.ok) throw new Error(`${response.status} ${url}`);
+      return await response.text();
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) await sleep(attempt * 1500);
+    }
+  }
+  throw lastError;
+}
+
 function validateSnapshots(snapshots) {
   if (snapshots.length !== etfs.length) {
     throw new Error(`Incomplete ETF snapshot: expected ${etfs.length}, received ${snapshots.length}`);
@@ -168,23 +190,86 @@ async function latestEtfSnapshot(options) {
   }
 }
 
-async function latestFundRows({ fetchFn, sleep, now }) {
-  const url = new URL('https://api.fund.eastmoney.com/f10/lsjz');
-  url.search = new URLSearchParams({
-    fundCode, pageIndex: '1', pageSize: '100', startDate: entryDate, endDate: shanghaiDate(now),
-  });
-  const payload = await fetchJson(url, {
-    fetchFn,
-    sleep,
-    headers: { Referer: 'https://fundf10.eastmoney.com/' },
-  });
-  const rows = payload?.Data?.LSJZList ?? [];
-  const normalized = rows
+function normalizeFundRows(rows) {
+  return [...new Map(rows
     .map(row => ({ date: row.FSRQ, nav: Number(row.DWJZ) }))
     .filter(row => /^\d{4}-\d{2}-\d{2}$/.test(row.date) && Number.isFinite(row.nav) && row.nav > 0)
+    .map(row => [row.date, row])).values()]
     .sort((a, b) => a.date.localeCompare(b.date));
-  if (!normalized.length) throw new Error(`No valid NAV history for ${fundCode}`);
+}
+
+async function paginatedFundRows({ fetchFn, sleep, now }) {
+  const pageSize = 20;
+  const rows = [];
+  const seenDates = new Set();
+  let expectedTotal = null;
+  for (let pageIndex = 1; pageIndex <= 100; pageIndex++) {
+    const url = new URL('https://api.fund.eastmoney.com/f10/lsjz');
+    url.search = new URLSearchParams({
+      fundCode, pageIndex: String(pageIndex), pageSize: String(pageSize),
+      startDate: entryDate, endDate: shanghaiDate(now),
+    });
+    const payload = await fetchJson(url, {
+      fetchFn,
+      sleep,
+      headers: { Referer: 'https://fundf10.eastmoney.com/' },
+    });
+    const pageRows = payload?.Data?.LSJZList;
+    if (!Array.isArray(pageRows)) throw new Error(`Invalid fund NAV page ${pageIndex}`);
+    const totalCount = Number(payload?.TotalCount);
+    if (Number.isInteger(totalCount) && totalCount >= 0) {
+      expectedTotal = expectedTotal === null ? totalCount : Math.max(expectedTotal, totalCount);
+    }
+    rows.push(...pageRows);
+    const previousSize = seenDates.size;
+    pageRows.forEach(row => seenDates.add(row?.FSRQ));
+    if (expectedTotal !== null && seenDates.size >= expectedTotal) break;
+    if (!pageRows.length || pageRows.length < pageSize) break;
+    if (seenDates.size === previousSize) throw new Error(`Fund NAV pagination stalled at page ${pageIndex}`);
+    if (pageIndex === 100) throw new Error('Fund NAV pagination exceeded safety limit');
+  }
+  if (expectedTotal !== null && seenDates.size < expectedTotal) {
+    throw new Error(`Incomplete fund NAV pagination: expected ${expectedTotal}, received ${seenDates.size}`);
+  }
+  if (!normalizeFundRows(rows).length) throw new Error(`No valid NAV history for ${fundCode}`);
+  const normalized = normalizeFundRows([
+    ...rows,
+    { FSRQ: entryDate, DWJZ: fundEntryNav },
+  ]);
   return normalized;
+}
+
+async function chartFundRows({ fetchFn, sleep, now }) {
+  const url = `https://fund.eastmoney.com/pingzhongdata/${fundCode}.js?v=${now.getTime()}`;
+  const body = await fetchText(url, {
+    fetchFn,
+    sleep,
+    headers: { Referer: `https://fund.eastmoney.com/${fundCode}.html` },
+  });
+  const match = body.match(/var Data_netWorthTrend\s*=\s*(\[[\s\S]*?\]);/);
+  if (!match) throw new Error(`Missing backup NAV history for ${fundCode}`);
+  const rows = JSON.parse(match[1]).map(row => ({
+    FSRQ: shanghaiDate(new Date(Number(row.x))),
+    DWJZ: row.y,
+  })).filter(row => row.FSRQ >= entryDate && row.FSRQ <= shanghaiDate(now));
+  if (!normalizeFundRows(rows).length) throw new Error(`No valid backup NAV history for ${fundCode}`);
+  const normalized = normalizeFundRows([
+    ...rows,
+    { FSRQ: entryDate, DWJZ: fundEntryNav },
+  ]);
+  return normalized;
+}
+
+async function latestFundRows(options) {
+  try {
+    return await paginatedFundRows(options);
+  } catch (primaryError) {
+    try {
+      return await chartFundRows(options);
+    } catch (backupError) {
+      throw new AggregateError([primaryError, backupError], 'Both fund NAV sources are unavailable');
+    }
+  }
 }
 
 async function tencentHistoricalCloses({ fetchFn, sleep, endDate }) {
@@ -212,11 +297,51 @@ async function tencentHistoricalCloses({ fetchFn, sleep, endDate }) {
   return new Map(histories);
 }
 
+async function eastmoneyHistoricalCloses({ fetchFn, sleep, endDate }) {
+  const begin = entryDate.replaceAll('-', '');
+  const end = endDate.replaceAll('-', '');
+  const histories = await Promise.all(etfs.map(async item => {
+    const url = new URL('https://push2his.eastmoney.com/api/qt/stock/kline/get');
+    url.search = new URLSearchParams({
+      secid: `${item.market}.${item.code}`, klt: '101', fqt: '0',
+      beg: begin, end, lmt: '200', fields1: 'f1,f2,f3,f4,f5,f6', fields2: 'f51,f52,f53',
+    });
+    const payload = await fetchJson(url, { fetchFn, sleep });
+    const rows = payload?.data?.klines;
+    if (!Array.isArray(rows) || !rows.length) {
+      throw new Error(`No Eastmoney history for ${item.code}`);
+    }
+    const closes = new Map(rows
+      .map(row => String(row).split(','))
+      .map(fields => [fields[0], Number(fields[2])])
+      .filter(([date, close]) => /^\d{4}-\d{2}-\d{2}$/.test(date) && Number.isFinite(close) && close > 0));
+    if (!closes.size) throw new Error(`Invalid Eastmoney history for ${item.code}`);
+    return [item.code, closes];
+  }));
+  return new Map(histories);
+}
+
+async function latestHistoricalCloses(options) {
+  try {
+    return await tencentHistoricalCloses(options);
+  } catch (tencentError) {
+    try {
+      return await eastmoneyHistoricalCloses(options);
+    } catch (eastmoneyError) {
+      throw new AggregateError(
+        [tencentError, eastmoneyError],
+        'Both ETF historical sources are unavailable',
+      );
+    }
+  }
+}
+
 function fundNavOn(rows, date, fallback) {
   if (date === entryDate) return fundEntryNav;
   const row = rows.filter(item => item.date <= date).at(-1);
   if (row) return row.nav;
   if (fallback.date <= date) return fallback.nav;
+  if (date > entryDate) return fundEntryNav;
   throw new Error(`No ${fundCode} NAV on or before ${date}`);
 }
 
@@ -254,7 +379,7 @@ export async function updatePortfolio({
   const [etfResult, fundResult, historyResult] = await Promise.allSettled([
     latestEtfSnapshot({ fetchFn, sleep }),
     latestFundRows({ fetchFn, sleep, now }),
-    tencentHistoricalCloses({ fetchFn, sleep, endDate: throughDate }),
+    latestHistoricalCloses({ fetchFn, sleep, endDate: throughDate }),
   ]);
   if (etfResult.status === 'rejected') {
     logger.warn(`ETF source unavailable; keeping the last complete snapshot: ${etfResult.reason}`);
@@ -264,6 +389,12 @@ export async function updatePortfolio({
   }
   if (historyResult.status === 'rejected') {
     logger.warn(`Historical source unavailable; keeping the existing confirmed curve: ${historyResult.reason}`);
+  }
+  if (etfResult.status === 'rejected' && historyResult.status === 'rejected') {
+    throw new AggregateError(
+      [etfResult.reason, historyResult.reason],
+      'No usable ETF source; refusing to report a successful stale update',
+    );
   }
 
   const fundRows = fundResult.status === 'fulfilled' ? fundResult.value : [];
@@ -307,14 +438,15 @@ export async function updatePortfolio({
 
   // Rebuild the curve from a complete common trading calendar. This fills any
   // weekday missed by a failed workflow without ever inventing weekend points.
-  if (historyResult.status === 'fulfilled' && fundRows.length) {
+  if (historyResult.status === 'fulfilled') {
     const closesByCode = historyResult.value;
+    const rebuildFrom = fundRows.length ? entryDate : oldHistory.at(-1).date;
     const commonDates = [...closesByCode.get(etfs[0].code).keys()]
-      .filter(date => date >= entryDate && date <= throughDate &&
+      .filter(date => (fundRows.length ? date >= rebuildFrom : date > rebuildFrom) && date <= throughDate &&
         etfs.every(item => closesByCode.get(item.code)?.has(date)))
       .sort();
-    if (commonDates.length && commonDates[0] === entryDate) {
-      history = commonDates.map(date => {
+    if (commonDates.length) {
+      const rebuiltHistory = commonDates.map(date => {
         const historicalMarket = Object.fromEntries(etfs.map(item => [item.code, {
           entry: oldMarket[item.code].entry,
           price: closesByCode.get(item.code).get(date),
@@ -324,11 +456,14 @@ export async function updatePortfolio({
           nav: portfolioNav(historicalMarket, fundNavOn(fundRows, date, newFund), cost),
         };
       });
-      history[0].nav = 1;
+      if (commonDates[0] === entryDate) rebuiltHistory[0].nav = 1;
+      const mergedHistory = new Map(history.map(point => [point.date, point]));
+      rebuiltHistory.forEach(point => mergedHistory.set(point.date, point));
+      history = [...mergedHistory.values()].sort((a, b) => a.date.localeCompare(b.date));
 
       const latestDate = commonDates.at(-1);
-      if (latestDate > previousDate &&
-          (etfResult.status !== 'fulfilled' || etfResult.value[0].date !== latestDate)) {
+      const currentMarketDate = [...new Set(Object.values(market).map(item => item.date))][0];
+      if (latestDate > currentMarketDate) {
         const priorDate = commonDates.at(-2) ?? latestDate;
         market = Object.fromEntries(etfs.map(item => [item.code, {
           entry: oldMarket[item.code].entry,
@@ -338,6 +473,10 @@ export async function updatePortfolio({
         }]));
       }
     }
+  }
+
+  if (history.at(-1).date < oldHistory.at(-1).date) {
+    throw new Error('Refusing to truncate confirmed portfolio history');
   }
 
   let html = replaceConstant(before, 'MARKET_FALLBACK', market);
