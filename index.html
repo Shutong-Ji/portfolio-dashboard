@@ -24,7 +24,7 @@ const holdings=[
 ].map(([code,name,amount,market])=>{const fallback=MARKET_FALLBACK[code];return{code,name,amount,market,entry:fallback?.entry??null,price:fallback?.price??null,pre:fallback?.pre??null,quoteDate:fallback?.date??null,fee:market==='fund'?0:null,units:null}});
 const ENTRY_BASIS='raw-close-field-2026-07-28-v3';
 const FUND_ENTRY_BASIS='fixed-nav-2026-07-28-1.3263-v2';
-const FUND_FALLBACK={"009803":{"entry":1.3263,"nav":1.3336,"pre":1.329,"date":"2026-11-17"}};
+const FUND_FALLBACK={"009803":{"entry":1.3263,"nav":1.3336,"pre":1.3336,"date":"2026-11-18"}};
 const money=n=>n==null?'--':'¥'+n.toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2});
 const unit=(n,digits)=>n==null?'--':'¥'+n.toLocaleString('zh-CN',{minimumFractionDigits:digits,maximumFractionDigits:digits});
 const pct=n=>n==null?'--':(n>=0?'+':'')+n.toFixed(2)+'%';
